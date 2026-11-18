@@ -1,0 +1,3 @@
+<host>/_user/.ssh/
+*.log
+.DS_Store
