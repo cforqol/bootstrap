@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
 # bootstrap — apply personal configs on a Debian/Ubuntu machine.
-set -euo pipefail
 
 REPO="${BOOTSTRAP_REPO:-https://github.com/cforqol/bootstrap}"
 REF="${BOOTSTRAP_REF:-main}"
+
+# Re-exec under bash from a downloaded copy when piped in (curl | bash) or
+# started under a non-bash shell. Deliberately above set -euo pipefail and
+# above every bashism, so it also works when this file is fed to sh.
+if [ -z "${BOOTSTRAP_REEXEC:-}" ] && { [ -z "${BASH_VERSION:-}" ] || [ ! -t 0 ]; }; then
+    command -v curl >/dev/null 2>&1 || { echo "curl required" >&2; exit 1; }
+    tmpd="$(mktemp -d)" || { echo "mktemp failed" >&2; exit 1; }
+    mkdir -p "$tmpd/lib"
+    curl -fsSL --proto '=https' --tlsv1.2 "${BOOTSTRAP_URL:-$REPO/raw/$REF/setup.sh}" \
+        -o "$tmpd/setup.sh" \
+        || { echo "download failed: $REPO/raw/$REF/setup.sh" >&2; exit 1; }
+    curl -fsSL --proto '=https' --tlsv1.2 "${BOOTSTRAP_LIB_URL:-$REPO/raw/$REF/lib/common.sh}" \
+        -o "$tmpd/lib/common.sh" \
+        || { echo "download failed: $REPO/raw/$REF/lib/common.sh" >&2; exit 1; }
+    if [ -r /dev/tty ]; then
+        BOOTSTRAP_REEXEC=1 BOOTSTRAP_TMPD="$tmpd" exec bash "$tmpd/setup.sh" "$@" </dev/tty
+    fi
+    BOOTSTRAP_REEXEC=1 BOOTSTRAP_TMPD="$tmpd" exec bash "$tmpd/setup.sh" "$@" </dev/null
+fi
+
+set -euo pipefail
+
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/bootstrap"
 SRC="$DATA/src"
 DOTS_SRC="${XDG_DATA_HOME:-$HOME/.local/share}/dots"
@@ -12,23 +33,15 @@ DOTS_COMMIT="5eb8c51e64f1bc73b3c3031c23229ebb2f7424bc"
 APPS=(); ALL=false; DRY=false; NO_SECRETS=false; YES=false
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
 
-if [[ -z "${BASH_VERSION:-}" || ! -t 0 ]]; then
-    if [[ -r /dev/tty ]]; then
-        have_curl=0; command -v curl >/dev/null || have_curl=1
-        (( have_curl )) && { echo "curl required" >&2; exit 1; }
-        tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
-        curl -fsSL --proto '=https' --tlsv1.2 "${BOOTSTRAP_URL:-$REPO/raw/$REF/setup.sh}" -o "$tmp"
-        exec bash "$tmp" "$@" </dev/tty
-    fi
-    [[ -n "${BASH_VERSION:-}" ]] || { echo "bash required" >&2; exit 1; }
-fi
-
 TTY_IN=/dev/null
 [[ -t 0 ]] && TTY_IN=/dev/stdin
 [[ "$TTY_IN" == /dev/null && -r /dev/tty ]] && TTY_IN=/dev/tty
 
 # shellcheck source=lib/common.sh
 source "$SELF_DIR/lib/common.sh"
+
+# Clean up the downloaded copy on exit.
+[[ -n "${BOOTSTRAP_TMPD:-}" ]] && trap 'rm -rf "$BOOTSTRAP_TMPD"' EXIT
 
 usage() {
     cat >&2 <<EOF
@@ -78,14 +91,15 @@ preflight() {
 fetch() {
     log_step "fetch"
     if [[ -d "$SRC/.git" ]]; then
-        [[ -z "$(git -C "$SRC" status --porcelain)" ]] || die "$SRC has local changes"
-        run git -C "$SRC" fetch --quiet origin
-        run git -C "$SRC" checkout --quiet "$REF"
+        [[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]] \
+            || die "$SRC has local changes"
+        run git -C "$SRC" fetch --quiet --depth 1 origin "$REF"
+        run git -C "$SRC" reset --hard --quiet FETCH_HEAD
     else
         run mkdir -p "$DATA"
         run git clone --quiet --depth 1 --branch "$REF" "$REPO" "$SRC"
     fi
-    log_ok "$SRC @ $REF"
+    log_ok "$SRC @ $REF ($(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo '?'))"
 }
 
 fetch_dots() {
@@ -105,10 +119,16 @@ select_apps() {
     log_step "apps"
     local d a
     if [[ "$ALL" == true ]]; then
-        for d in "$SRC"/configs/*/; do [[ -d "$d" ]] && APPS+=("$(basename "$d")"); done
+        for d in "$SRC"/configs/*/; do
+            [[ -d "$d" ]] || continue
+            APPS+=("$(basename "$d")")
+        done
     elif (( ${#APPS[@]} == 0 )); then
         local -a avail=()
-        for d in "$SRC"/configs/*/; do [[ -d "$d" ]] && avail+=("$(basename "$d")"); done
+        for d in "$SRC"/configs/*/; do
+            [[ -d "$d" ]] || continue
+            avail+=("$(basename "$d")")
+        done
         (( ${#avail[@]} )) || die "no apps in $SRC/configs"
         [[ "$TTY_IN" == /dev/null ]] && die "no apps given; use --all"
         printf '\n  available: %s\n\n  apply which: ' "${avail[*]}" >&2
@@ -122,9 +142,14 @@ select_apps() {
 }
 
 app_is_encrypted() {
-    local f
+    local f rel out
     while IFS= read -r -d '' f; do
         head -c 10 "$f" 2>/dev/null | grep -qa GITCRYPT && return 0
+    done < <(find "$SRC/configs/$1" -type f -print0 2>/dev/null)
+    while IFS= read -r -d '' f; do
+        rel="${f#"$SRC"/}"
+        out="$(git -C "$SRC" check-attr filter -- "$rel" 2>/dev/null || true)"
+        [[ "$out" == *": git-crypt" ]] && return 0
     done < <(find "$SRC/configs/$1" -type f -print0 2>/dev/null)
     return 1
 }
