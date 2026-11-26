@@ -3,8 +3,9 @@
 #
 #   curl -fsSL https://github.com/cforqol/bootstrap/raw/main/setup.sh | bash
 #
-# Reads hosts/<hostname>/ if present, else hosts/generic/, and installs it as
-# the dots working tree for this machine.
+# Reads hosts/<hostname>/ if present, else hosts/generic/, copies it into a
+# dots working tree at ~/.config/dotfiles/<hostname>/, and applies it.
+# Files marked filter=git-crypt are skipped: public provisioning only.
 
 REPO="${BOOTSTRAP_REPO:-https://github.com/cforqol/bootstrap}"
 REF="${BOOTSTRAP_REF:-main}"
@@ -135,15 +136,37 @@ resolve_host() {
     log_ok "host $HOST"
 }
 
+filter_attr() {   # $1 = path relative to the repo root; prints the filter value
+    local _p _a v=""
+    { IFS= read -r -d '' _p; IFS= read -r -d '' _a; IFS= read -r -d '' v; } \
+        < <(git -C "$SRC" check-attr -z filter -- "$1" 2>/dev/null) || true
+    printf '%s' "$v"
+}
+
 stage() {
     log_step "stage"
     local src="$SRC/hosts/$HOST"
     [[ -d "$src" ]] || src="$SRC/hosts/generic"
     [[ -d "$src" ]] || die "no host tree: hosts/$HOST or hosts/generic"
     [[ -d "$DOTS_REPO/$HOST" ]] && log_warn "replacing $DOTS_REPO/$HOST"
+
     run rm -rf "${DOTS_REPO:?}/$HOST"
-    run cp -a "$src" "$DOTS_REPO/$HOST"
-    log_ok "$(basename "$src") -> $HOST"
+
+    local f rel repo_rel dest n=0 skipped=0
+    while IFS= read -r -d '' f; do
+        rel="${f#"$src/"}"
+        repo_rel="${f#"$SRC/"}"
+        if [[ "$(filter_attr "$repo_rel")" == git-crypt ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        dest="$DOTS_REPO/$HOST/$rel"
+        run mkdir -p "$(dirname "$dest")"
+        run cp -a "$f" "$dest"
+        n=$((n + 1))
+    done < <(find "$src" -type f -print0)
+
+    log_ok "$(basename "$src") -> $HOST ($n copied, $skipped encrypted skipped)"
 }
 
 backup_existing() {
@@ -153,14 +176,14 @@ backup_existing() {
         rel="${f#"$DOTS_REPO/$HOST/_user/"}"
         dest="$HOME/$rel"
         if [[ -e "$dest" && ! -L "$dest" ]]; then
-            run cp -a "$dest" "$dest.bak"; n=$((n+1))
+            run cp -a "$dest" "$dest.bak"; n=$((n + 1))
         fi
     done < <(find "$DOTS_REPO/$HOST/_user" -type f -print0 2>/dev/null)
     while IFS= read -r -d '' f; do
         rel="${f#"$DOTS_REPO/$HOST/_root/"}"
         dest="/$rel"
         if [[ -e "$dest" && ! -L "$dest" ]]; then
-            run sudo cp -a "$dest" "$dest.bak"; n=$((n+1))
+            run sudo cp -a "$dest" "$dest.bak"; n=$((n + 1))
         fi
     done < <(find "$DOTS_REPO/$HOST/_root" -type f -print0 2>/dev/null)
     log_ok "$n files backed up (.bak)"
