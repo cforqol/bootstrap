@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# bootstrap — apply personal configs on a Debian/Ubuntu machine.
+# bootstrap — provision this machine with the dotfiles in this repo, via dots.
+#
+#   curl -fsSL https://github.com/cforqol/bootstrap/raw/main/setup.sh | bash
+#
+# Reads hosts/<hostname>/ if present, else hosts/generic/, and installs it as
+# the dots working tree for this machine.
 
 REPO="${BOOTSTRAP_REPO:-https://github.com/cforqol/bootstrap}"
 REF="${BOOTSTRAP_REF:-main}"
+TOOL_REPO="${BOOTSTRAP_TOOL_REPO:-https://github.com/cforqol/dots}"
+TOOL_COMMIT="${BOOTSTRAP_TOOL_COMMIT:-5eb8c51e64f1bc73b3c3031c23229ebb2f7424bc}"
 
-# Re-exec under bash from a downloaded copy when piped in (curl | bash) or
-# started under a non-bash shell. Deliberately above set -euo pipefail and
-# above every bashism, so it also works when this file is fed to sh.
+VERSION=1
+
+# Re-exec under bash from a downloaded copy when piped in or under a non-bash shell.
 if [ -z "${BOOTSTRAP_REEXEC:-}" ] && { [ -z "${BASH_VERSION:-}" ] || [ ! -t 0 ]; }; then
     command -v curl >/dev/null 2>&1 || { echo "curl required" >&2; exit 1; }
     tmpd="$(mktemp -d)" || { echo "mktemp failed" >&2; exit 1; }
@@ -27,12 +34,11 @@ set -euo pipefail
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/bootstrap"
 SRC="$DATA/src"
-DOTS_SRC="${XDG_DATA_HOME:-$HOME/.local/share}/dots"
-DOTS_COMMIT="5eb8c51e64f1bc73b3c3031c23229ebb2f7424bc"
+TOOL="$DATA/tool"
+DOTS_REPO="${DOTS_REPO:-${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles}"
 
-APPS=(); ALL=false; DRY=false; NO_SECRETS=false; YES=false
+DRY=false; YES=false
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
-
 TTY_IN=/dev/null
 [[ -t 0 ]] && TTY_IN=/dev/stdin
 [[ "$TTY_IN" == /dev/null && -r /dev/tty ]] && TTY_IN=/dev/tty
@@ -40,37 +46,25 @@ TTY_IN=/dev/null
 # shellcheck source=lib/common.sh
 source "$SELF_DIR/lib/common.sh"
 
-# Clean up the downloaded copy on exit.
 [[ -n "${BOOTSTRAP_TMPD:-}" ]] && trap 'rm -rf "$BOOTSTRAP_TMPD"' EXIT
 
 usage() {
     cat >&2 <<EOF
-bootstrap — apply personal configs via dots
+bootstrap — provision this machine with dotfiles from $REPO
 
-  curl -fsSL $REPO/raw/$REF/setup.sh | bash -s -- vim git
+  curl -fsSL $REPO/raw/$REF/setup.sh | bash
 
-  --all          every app
-  --no-secrets   skip encrypted configs
-  --repo URL     config repo (default: $REPO)
-  --ref REF      git ref (default: $REF)
-  -y, --yes      no prompts
-  -n, --dry-run  show, change nothing
-  -h, --help     this
+  --version   print version
+  -h, --help  this
 EOF
     exit "${1:-0}"
 }
 
 while (( $# )); do
     case "$1" in
-        --all)        ALL=true; shift ;;
-        --no-secrets) NO_SECRETS=true; shift ;;
-        --repo)       REPO="${2:?}"; shift 2 ;;
-        --ref)        REF="${2:?}"; shift 2 ;;
-        -y|--yes)     YES=true; shift ;;
-        -n|--dry-run) DRY=true; shift ;;
+        --version|-V) printf 'bootstrap %s\n' "$VERSION"; exit 0 ;;
         -h|--help)    usage 0 ;;
-        -*)           die "unknown flag: $1" ;;
-        *)            APPS+=("$1"); shift ;;
+        *)            die "setup.sh takes no arguments (got: $1)" ;;
     esac
 done
 
@@ -88,8 +82,8 @@ preflight() {
     log_ok "ok"
 }
 
-fetch() {
-    log_step "fetch"
+fetch_repo() {
+    log_step "bootstrap"
     if [[ -d "$SRC/.git" ]]; then
         [[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]] \
             || die "$SRC has local changes"
@@ -99,179 +93,112 @@ fetch() {
         run mkdir -p "$DATA"
         run git clone --quiet --depth 1 --branch "$REF" "$REPO" "$SRC"
     fi
-    log_ok "$SRC @ $REF ($(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+    log_ok "$SRC @ $REF"
 }
 
-fetch_dots() {
+fetch_tool() {
     log_step "dots"
-    [[ -d "$DOTS_SRC/.git" ]] || run git clone --quiet https://github.com/cforqol/dots "$DOTS_SRC"
-    run git -C "$DOTS_SRC" fetch --quiet origin
-    run git -C "$DOTS_SRC" checkout --quiet "$DOTS_COMMIT"
-    [[ "$DRY" == true ]] && { log_info "would install dots"; return 0; }
-    mkdir -p "$HOME/.local/bin"
-    ln -sfn "$DOTS_SRC/dots.sh" "$HOME/.local/bin/dots"
+    if [[ -d "$TOOL/.git" ]]; then
+        run git -C "$TOOL" fetch --quiet origin
+    else
+        run mkdir -p "$DATA"
+        run git clone --quiet "$TOOL_REPO" "$TOOL"
+    fi
+    run git -C "$TOOL" checkout --quiet "$TOOL_COMMIT"
+    log_ok "tool @ ${TOOL_COMMIT:0:7}"
+}
+
+prepare_data() {
+    log_step "data repo"
+    run mkdir -p "$DOTS_REPO"
+    [[ -d "$DOTS_REPO/.git" ]] || run git -C "$DOTS_REPO" init --quiet
+    grep -qxF 'dots.sh' "$DOTS_REPO/.gitignore" 2>/dev/null \
+        || echo 'dots.sh' >> "$DOTS_REPO/.gitignore"
+    log_ok "$DOTS_REPO"
+}
+
+install_dots() {
+    run cp -f "$TOOL/dots.sh" "$DOTS_REPO/dots.sh"
+    chmod +x "$DOTS_REPO/dots.sh"
+    run mkdir -p "$HOME/.local/bin"
+    run ln -sfn "$DOTS_REPO/dots.sh" "$HOME/.local/bin/dots"
     have dots || export PATH="$HOME/.local/bin:$PATH"
     have dots || die "dots not on PATH"
     log_ok "dots ready"
 }
 
-select_apps() {
-    log_step "apps"
-    local d a
-    if [[ "$ALL" == true ]]; then
-        for d in "$SRC"/configs/*/; do
-            [[ -d "$d" ]] || continue
-            APPS+=("$(basename "$d")")
-        done
-    elif (( ${#APPS[@]} == 0 )); then
-        local -a avail=()
-        for d in "$SRC"/configs/*/; do
-            [[ -d "$d" ]] || continue
-            avail+=("$(basename "$d")")
-        done
-        (( ${#avail[@]} )) || die "no apps in $SRC/configs"
-        [[ "$TTY_IN" == /dev/null ]] && die "no apps given; use --all"
-        printf '\n  available: %s\n\n  apply which: ' "${avail[*]}" >&2
-        local line; read -r line < "$TTY_IN" || die "no input"
-        # shellcheck disable=SC2206
-        APPS=($line)
-    fi
-    (( ${#APPS[@]} )) || die "nothing selected"
-    for a in "${APPS[@]}"; do [[ -d "$SRC/configs/$a" ]] || die "unknown app: $a"; done
-    log_ok "${APPS[*]}"
+resolve_host() {
+    HOST="$(host_slug)"
+    [[ -n "$HOST" ]] || die "cannot determine hostname"
+    mkdir -p "$HOME/.dots"
+    printf '%s\n' "$HOST" > "$HOME/.dots/host"
+    log_ok "host $HOST"
 }
 
-app_is_encrypted() {
-    local f rel out
+stage() {
+    log_step "stage"
+    local src="$SRC/hosts/$HOST"
+    [[ -d "$src" ]] || src="$SRC/hosts/generic"
+    [[ -d "$src" ]] || die "no host tree: hosts/$HOST or hosts/generic"
+    [[ -d "$DOTS_REPO/$HOST" ]] && log_warn "replacing $DOTS_REPO/$HOST"
+    run rm -rf "${DOTS_REPO:?}/$HOST"
+    run cp -a "$src" "$DOTS_REPO/$HOST"
+    log_ok "$(basename "$src") -> $HOST"
+}
+
+backup_existing() {
+    log_step "backup"
+    local rel dest n=0
     while IFS= read -r -d '' f; do
-        head -c 10 "$f" 2>/dev/null | grep -qa GITCRYPT && return 0
-    done < <(find "$SRC/configs/$1" -type f -print0 2>/dev/null)
+        rel="${f#"$DOTS_REPO/$HOST/_user/"}"
+        dest="$HOME/$rel"
+        if [[ -e "$dest" && ! -L "$dest" ]]; then
+            run cp -a "$dest" "$dest.bak"; n=$((n+1))
+        fi
+    done < <(find "$DOTS_REPO/$HOST/_user" -type f -print0 2>/dev/null)
     while IFS= read -r -d '' f; do
-        rel="${f#"$SRC"/}"
-        out="$(git -C "$SRC" check-attr filter -- "$rel" 2>/dev/null || true)"
-        [[ "$out" == *": git-crypt" ]] && return 0
-    done < <(find "$SRC/configs/$1" -type f -print0 2>/dev/null)
-    return 1
-}
-
-prune() {
-    local -a keep=(); local a
-    for a in "${APPS[@]}"; do [[ "$a" == "$1" ]] || keep+=("$a"); done
-    APPS=("${keep[@]}")
-}
-
-crypto() {
-    log_step "secrets"
-    local -a enc=(); local a
-    for a in "${APPS[@]}"; do app_is_encrypted "$a" && enc+=("$a"); done
-    (( ${#enc[@]} )) || { log_ok "no encrypted configs"; return 0; }
-
-    if [[ "$NO_SECRETS" == true ]]; then
-        for a in "${enc[@]}"; do prune "$a"; done
-        log_warn "--no-secrets: skipped ${enc[*]}"; return 0
-    fi
-
-    if ! have git-crypt; then
-        log_warn "encrypted: ${enc[*]}"
-        if ask "install git-crypt?" y; then
-            run sudo apt-get update -qq
-            run sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git-crypt
-            have git-crypt || die "git-crypt still missing"
-        else
-            for a in "${enc[@]}"; do prune "$a"; done
-            log_warn "skipped ${enc[*]}"; return 0
+        rel="${f#"$DOTS_REPO/$HOST/_root/"}"
+        dest="/$rel"
+        if [[ -e "$dest" && ! -L "$dest" ]]; then
+            run sudo cp -a "$dest" "$dest.bak"; n=$((n+1))
         fi
-    fi
-
-    if git -C "$SRC" grep -q '^\*GITCRYPT\*' -- . 2>/dev/null; then
-        local kp
-        printf '  key path (blank to skip): ' >&2
-        read -r kp < "$TTY_IN" || kp=""
-        [[ -n "$kp" ]] && run dots unlock "$kp" || log_warn "repo still locked"
-    fi
+    done < <(find "$DOTS_REPO/$HOST/_root" -type f -print0 2>/dev/null)
+    log_ok "$n files backed up (.bak)"
 }
 
-init_dots() {
-    log_step "init"
-    local host; host="$(host_slug)"
-    [[ -d "$SRC/$host/_user" ]] && { log_ok "$host already initialized"; return 0; }
-    ( cd "$SRC" && run bash "$DOTS_SRC/dots.sh" init ) || die "dots init failed"
-    log_ok "initialized $host"
-}
-
-# builds SRC_FILES / TARGETS / TARGET_APP, relative-links into the host tree
-plan_links() {
-    local host; host="$(host_slug)"
-    local a scope rel f tgt link
-    SRC_FILES=(); TARGETS=(); TARGET_APP=(); LINKS=()
-
-    for a in "${APPS[@]}"; do
-        for scope in _user _root; do
-            [[ -d "$SRC/configs/$a/$scope" ]] || continue
-            while IFS= read -r -d '' f; do
-                rel="${f#"$SRC/configs/$a/$scope/"}"
-                tgt="$SRC/$host/$scope/$rel"
-                SRC_FILES+=("$f"); TARGETS+=("$tgt"); TARGET_APP+=("$a")
-                LINKS+=("$(realpath --relative-to="$(dirname "$tgt")" "$f")")
-            done < <(find "$SRC/configs/$a/$scope" -type f -print0)
-        done
-    done
-
-    local -A seen=(); local i
-    for i in "${!TARGETS[@]}"; do
-        if [[ -n "${seen[${TARGETS[$i]}]:-}" ]]; then
-            die "conflict: ${TARGET_APP[$i]} and ${seen[${TARGETS[$i]}]} both provide ${TARGETS[$i]#"$SRC/$host/"}"
-        fi
-        seen["${TARGETS[$i]}"]="${TARGET_APP[$i]}"
-    done
-}
-
-write_links() {
-    log_step "link"
-    local i
-    for i in "${!TARGETS[@]}"; do
-        run mkdir -p "$(dirname "${TARGETS[$i]}")"
-        run ln -sfn "${LINKS[$i]}" "${TARGETS[$i]}"
-    done
-    log_ok "${#TARGETS[@]} links"
-}
-
-apply() {
+apply_configs() {
     log_step "apply"
-    if [[ "$DRY" == true ]]; then
-        log_info "would run: dots apply"
-        return 0
-    fi
-    ( cd "$SRC" && dots apply ) || die "dots apply failed"
-
-    local has_root=0 i
-    for i in "${!TARGETS[@]}"; do [[ "${TARGETS[$i]}" == *"/_root/"* ]] && has_root=1; done
-    if (( has_root )); then
-        log_warn "system files go to / — backing up originals to *.bak"
-        for i in "${!TARGETS[@]}"; do
-            [[ "${TARGETS[$i]}" == *"/_root/"* ]] || continue
-            local real="/${TARGETS[$i]#*"/_root/"}"
-            [[ -e "$real" && ! -L "$real" ]] && run sudo cp -a "$real" "$real.bak"
-        done
-        ( cd "$SRC" && sudo dots apply-all ) || die "dots apply-all failed"
-    fi
+    ( cd "$DOTS_REPO" && dots apply-all ) || die "dots apply-all failed"
     log_ok "applied"
+}
+
+fix_perms() {
+    [[ -d "$DOTS_REPO/$HOST/_root" ]] || return 0
+    log_step "permissions"
+    local f
+    while IFS= read -r -d '' f; do
+        if [[ "$f" == */.ssh/* || "$f" == */authorized_keys || "$f" == *.key ]]; then
+            run sudo chmod 600 "$f"
+        else
+            run sudo chmod 644 "$f"
+        fi
+    done < <(find "$DOTS_REPO/$HOST/_root" -type f -print0)
+    log_ok "ok"
 }
 
 main() {
     preflight
-    fetch
-    select_apps
-    printf '\n  repo %s\n  apps %s\n' "$REPO" "${APPS[*]}" >&2
+    fetch_repo
+    fetch_tool
+    prepare_data
+    install_dots
+    resolve_host
+    stage
+    backup_existing
     confirm
-    fetch_dots
-    crypto
-    (( ${#APPS[@]} )) || { log_warn "nothing left"; exit 0; }
-    init_dots
-    plan_links
-    write_links
-    apply
-    log_ok "done"
+    apply_configs
+    fix_perms
+    log_ok "done — $HOST from $DOTS_REPO"
 }
 
-main
+main "$@"
